@@ -36,15 +36,6 @@ func main() {
 	//log.Debugf("Terminated.")
 } //main()
 
-//todo: start sub workflows and wait for them to complete
-//todo: do actions/sub-workflow/a mix in parallel and wait
-//todo: deal with handlers that return an error
-//todo: deal with handlers that return custom types
-//todo: limit exec time
-//todo: log the full flow
-//todo: scale over many instances with shared persistent data, consider multiple workflow implementations - independant? - and multiple versions to also run independent, and how to know when old one is no longer in use
-//todo: scheduled tasks - e.g. shedule to continue at a specific time - combine with generic scheduler
-
 type sumAudit struct {
 	Args  []int  `json:"args"`
 	Oper  string `json:"oper"`
