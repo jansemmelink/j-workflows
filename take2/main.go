@@ -1,87 +1,74 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-msvc/errors"
+	aws "github.com/jansemmelink/j-workflow/aws"
+	workflows "github.com/jansemmelink/j-workflow/workflows2"
 	"github.com/stewelarend/logger"
 )
 
 var log = logger.New().WithLevel(logger.LevelDebug)
 
-//see if can hide yields from user
-
-type Instance interface {
-	YieldData(caller string) *yieldData
-}
-
-type instance struct {
-	yieldByCaller map[string]*yieldData
-
-	runs []*instanceRun
-}
-
-func newInstance() *instance {
-	return &instance{
-		yieldByCaller: map[string]*yieldData{},
-		runs:          []*instanceRun{},
-	}
-}
-
-func (inst instance) YieldData(caller string) *yieldData {
-	if yd, ok := inst.yieldByCaller[caller]; ok {
-		return yd
-	}
-	yd := &yieldData{
-		caller:  caller,
-		started: false,
-		done:    false,
-		result:  nil,
-		err:     nil,
-	}
-	inst.yieldByCaller[caller] = yd
-	return yd
-}
-
-func (inst *instance) Run(fnc func(ctx Instance) error) (*yieldData, error) {
-	thisRun := &instanceRun{}
-	inst.runs = append(inst.runs, thisRun)
-
-	err := fnc(inst)
-	if thisRun.yielded != nil {
-		return thisRun.yielded, nil
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed and not yielded")
-	}
-	return nil, nil //completed successfully
-}
-
-type instanceRun struct {
-	start   time.Time
-	end     time.Time
-	yielded *yieldData
-}
-
 func main() {
-	inst := newInstance()
-	for i := 0; i < 10; i++ {
-		log.Debugf("RUN %d", i+1)
-		yd, err := inst.Run(doSum)
-		if err != nil {
-			panic(fmt.Sprintf("run failed: %+v", err))
-		}
-		if yd == nil {
-			break
-		}
-		log.Debugf("Yielded at %s ...", yd.caller)
-		time.Sleep(400 * time.Millisecond)
+	qname := flag.String("qname", "Workflow-Test", "qname to consume in SQS")
+	flag.Parse()
+
+	myAWS, err := aws.New()
+	if err != nil {
+		panic(fmt.Sprintf("failed to connect with AWS: %+v", err))
 	}
-	log.Debugf("Done")
+
+	s3, err := myAWS.S3()
+	if err != nil {
+		panic(fmt.Sprintf("failed to connect to S3: %+v", err))
+	}
+	sm, err := workflows.NewSessions(s3, "workflow-sessions-"+strings.ToLower(*qname))
+	if err != nil {
+		panic(fmt.Sprintf("failed to create S3 session manager: %+v", err))
+	}
+
+	es, err := myAWS.SQS(*qname, true)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create SQS event stream: %+v", err))
+	}
+
+	//start mock service res processor to push mock service responses into event stream to continue workflows
+	resChan = make(chan map[string]interface{})
+	go func() {
+		for res := range resChan {
+			log.Debugf("Received res (%T)%+v", res, res)
+			contEvent := workflows.Event{
+				Cont: &workflows.ContEvent{
+					SessionID: res["session_id"].(string),
+					ContID:    res["cont_id"].(string),
+				},
+				Source: "internal mock service",
+				Time:   time.Now(),
+				Data:   res,
+			}
+			if err := es.PushContinue(contEvent); err != nil {
+				log.Errorf("Failed to push continue: %+v", err)
+			} else {
+				log.Debugf("Pushed cont:%+v source(%s) data:(%T)%+v", *contEvent.Cont, contEvent.Source, contEvent.Data, contEvent.Data)
+			}
+		}
+	}()
+
+	if err := workflows.New().
+		With("sum", sumWorkflow).
+		Run(sm, es, 2); err != nil {
+		panic(fmt.Sprintf("failed to run workflows: %+v", err))
+	}
 }
 
-func doSum(ctx Instance) error {
+// this is the workflow that the user will write, hiding the yields
+func sumWorkflow(ctx workflows.Context, req interface{}) error {
 	a := pickNr(ctx)
 	b := pickNr(ctx)
 	c := a * b
@@ -89,20 +76,37 @@ func doSum(ctx Instance) error {
 	return nil
 }
 
-// make it a workflow func for async execution
-func pickNr(ctx Instance) int {
-	v, err := yield(ctx, slowPickNr)
-	log.Debugf("pickNr() -> %v,%v", v, err)
-	if err != nil {
-		return 0
-	}
-	return v.(int)
-}
+//todo: child workflows, concurrencies and iterators on calls and child workflows and slow operations
+//todo: work with other and custom types - all able to marshal/unmarshal (or else serialize to []byte)
 
-// a slow function
+// actions that can be pre-built and custom
+// make it a workflow func for async execution
+func pickNr(ctx workflows.Context) int {
+	v, err := ctx.OnceSync(actionPickNr, nil)
+	log.Debugf("pickNr() -> %v,%v", v, err)
+
+	//slowPickNr never fails... but if it could, handle it
+	// if err != nil {
+	// 	return 0
+	// }
+
+	//cached value is parsed from JSON and could be float64
+	//so support conversion to int
+	//todo: see if response type can be passed or derived inside Once() by looking at result of func...
+	//this this will not be required, and also support other types
+	//could also then discard the logic in this func and just return v regardless as received from call to Once()
+	if i64, err := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64); err != nil {
+		log.Errorf("failed to parse (%T)%v as int64", v, v)
+		return 0
+	} else {
+		return int(i64)
+	}
+} //pickNr
+
+// a blocking action function (without continue event)
 var nrs = []int{5, 9, 11, 3}
 
-func slowPickNr(ctx Instance) (interface{}, error) {
+func actionPickNr(ctx workflows.Context, notUsedReq interface{}) (interface{}, error) {
 	time.Sleep(time.Second)
 	if len(nrs) == 0 {
 		return 0, errors.Errorf("no more numbers")
@@ -118,57 +122,81 @@ func slowPickNr(ctx Instance) (interface{}, error) {
 //todo: consume rather than poll, but still support poll as well for things that cannot send continue
 //todo: limits
 
-func send(ctx Instance, v int) {
-	fmt.Printf("sending %+v\n", v)
+// simulate an external service by using a channel where we can send request
+// and receive response
+type service struct {
+	reqChan chan serviceRequest
 }
 
-type actionFunc func(ctx Instance) (interface{}, error)
-
-type yieldData struct {
-	caller  string
-	started bool
-	start   time.Time
-	end     time.Time
-	done    bool
-	result  interface{}
-	err     error
+type serviceRequest struct {
+	sessionID string
+	contID    string
+	data      interface{}
+	resChan   chan map[string]interface{}
 }
 
-type CtxYieldInfoKey logger.Caller
+func (s *service) Run() {
+	s.reqChan = make(chan serviceRequest)
+	go func() {
+		for req := range s.reqChan {
+			log.Debugf("Processing service req (%T)%+v ...", req, req)
 
-func yield(ctx Instance, fnc actionFunc) (interface{}, error) {
-	//get source code reference to line in workflow that called this function
-	caller := fmt.Sprintf("%+v", logger.GetCaller(3)) //e.g. "main.go(45)"
+			//service processing ... simulate time it takes
+			time.Sleep(time.Second)
 
-	runs := ctx.(*instance).runs
-	thisRun := runs[len(runs)-1]
-	if thisRun.yielded != nil {
-		log.Debugf("yielded, skip %s", caller)
-		return nil, errors.Errorf("yielded") //already yielded on other step, fail this step
+			//send response
+			res := map[string]interface{}{
+				//header
+				"session_id": req.sessionID,
+				"cont_id":    req.contID,
+				//service response data (hard coded for now)
+				"response": 123,
+			}
+			req.resChan <- res
+		}
+	}()
+}
+
+var s service
+
+var resChan chan map[string]interface{}
+
+func init() {
+	s.Run()
+}
+
+// send something out on a queue, expecting a response or timeout
+// not keeping a go-routine running for this, e.g. when communicate
+// via nats or SQS etc...
+func send(ctx workflows.Context, v int) (interface{}, error) {
+	done, res, err := ctx.OnceAsync(startSend, contRecv, v)
+	log.Debugf("send() -> %v,%v", done, err)
+	if !done {
+		return nil, errors.Errorf("yielded")
 	}
-
-	//not yet yielded in this run
-	//check this caller
-	yd := ctx.YieldData(caller)
-	if !yd.started {
-		log.Debugf("yield(%s) starting...", caller)
-		thisRun.yielded = yd
-		yd.started = true
-		yd.start = time.Now()
-		go func() {
-			value, err := fnc(ctx)
-			log.Debugf("yield(%s) done -> (%T)%v, %v", yd.caller, value, value, err)
-			yd.result = value
-			yd.err = err
-			yd.done = true
-			yd.end = time.Now()
-		}()
-		return nil, errors.Errorf("yield(%s) started ... need to call again", caller)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to send")
 	}
+	return res, nil
+}
 
-	if !yd.done {
-		thisRun.yielded = yd
-		return nil, errors.Errorf("yield(%s) busy ... need to call again", caller)
+func startSend(ctx workflows.Context, contID string, req any) (err error) {
+	//send if not yet sent/yielded for another step
+	fmt.Printf("sending request (%T)%+v\n", req, req)
+	s.reqChan <- serviceRequest{
+		sessionID: ctx.ID(),
+		contID:    contID,
+		data:      req,
+		resChan:   resChan,
 	}
-	return yd.result, yd.err
-} //yield()
+	//return false to indicate need to wait until response is received (todo: or timeout)
+	return nil
+}
+
+// send request and wait for response in a go-routing, e.g. for HTTP
+// where response is quick and on the same connection
+func contRecv(ctx workflows.Context, res any) (result any, err error) {
+	log.Errorf("NYI(res=(%T)%+v")
+	//now need to yield until response is received or timeout
+	return nil, errors.Errorf("NYI")
+}
